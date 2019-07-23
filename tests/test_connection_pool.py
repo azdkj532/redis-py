@@ -532,3 +532,7 @@ class TestMultiConnectionClient(object):
         assert not r.connection
         assert r.set('a', '123')
         assert r.get('a') == b'123'
+
+
+class TestHealthChecks(object):
+    pass

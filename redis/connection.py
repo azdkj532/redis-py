@@ -2,6 +2,7 @@ from __future__ import unicode_literals
 from distutils.version import StrictVersion
 from errno import EWOULDBLOCK
 from itertools import chain
+from time import time
 import io
 import os
 import socket
@@ -20,17 +21,17 @@ from redis._compat import (xrange, imap, byte_to_chr, unicode, long,
                            LifoQueue, Empty, Full, urlparse, parse_qs,
                            recv, recv_into, unquote, BlockingIOError)
 from redis.exceptions import (
-    DataError,
-    RedisError,
-    ConnectionError,
-    TimeoutError,
-    BusyLoadingError,
-    ResponseError,
-    InvalidResponse,
     AuthenticationError,
-    NoScriptError,
+    BusyLoadingError,
+    ConnectionError,
+    DataError,
     ExecAbortError,
-    ReadOnlyError
+    InvalidResponse,
+    NoScriptError,
+    ReadOnlyError,
+    RedisError,
+    ResponseError,
+    TimeoutError,
 )
 from redis.utils import HIREDIS_AVAILABLE
 if HIREDIS_AVAILABLE:
@@ -460,7 +461,8 @@ class Connection(object):
                  socket_keepalive=False, socket_keepalive_options=None,
                  socket_type=0, retry_on_timeout=False, encoding='utf-8',
                  encoding_errors='strict', decode_responses=False,
-                 parser_class=DefaultParser, socket_read_size=65536):
+                 parser_class=DefaultParser, socket_read_size=65536,
+                 health_check_interval=0):
         self.pid = os.getpid()
         self.host = host
         self.port = int(port)
@@ -472,6 +474,8 @@ class Connection(object):
         self.socket_keepalive_options = socket_keepalive_options or {}
         self.socket_type = socket_type
         self.retry_on_timeout = retry_on_timeout
+        self.health_check_interval = health_check_interval
+        self.next_health_check = 0
         self.encoder = Encoder(encoding, encoding_errors, decode_responses)
         self._sock = None
         self._parser = parser_class(socket_read_size=socket_read_size)
@@ -575,19 +579,30 @@ class Connection(object):
 
     def on_connect(self):
         "Initialize the connection, authenticate and select a database"
-        self._parser.on_connect(self)
+        # temporarily disable health checks. PING will fail if the Redis
+        # server has a password set
+        health_check_interval = self.health_check_interval
+        self.health_check_interval = 0
+        try:
+            self._parser.on_connect(self)
 
-        # if a password is specified, authenticate
-        if self.password:
-            self.send_command('AUTH', self.password)
-            if nativestr(self.read_response()) != 'OK':
-                raise AuthenticationError('Invalid Password')
+            # if a password is specified, authenticate
+            if self.password:
+                self.send_command('AUTH', self.password)
+                if nativestr(self.read_response()) != 'OK':
+                    raise AuthenticationError('Invalid Password')
 
-        # if a database is specified, switch to it
-        if self.db:
-            self.send_command('SELECT', self.db)
-            if nativestr(self.read_response()) != 'OK':
-                raise ConnectionError('Invalid Database')
+            # if a database is specified, switch to it
+            if self.db:
+                self.send_command('SELECT', self.db)
+                if nativestr(self.read_response()) != 'OK':
+                    raise ConnectionError('Invalid Database')
+        finally:
+            # restore health checks
+            self.health_check_interval = health_check_interval
+
+        self.next_health_check = 0
+        self.check_health()
 
     def disconnect(self):
         "Disconnects from the Redis server"
@@ -601,6 +616,21 @@ class Connection(object):
         except socket.error:
             pass
         self._sock = None
+
+    def check_health(self):
+        "Check the health of the connection with a PING/PONG"
+        if self.health_check_interval and time() > self.next_health_check:
+            try:
+                self.send_command('PING')
+                if nativestr(self.read_response()) != 'PONG':
+                    raise ConnectionError(
+                        'Bad response from PING health check')
+            except (ConnectionError, TimeoutError) as ex:
+                self.disconnect()
+                self.send_command('PING')
+                if nativestr(self.read_response()) != 'PONG':
+                    raise ConnectionError(
+                        'Bad response from PING health check')
 
     def send_packed_command(self, command):
         "Send an already packed command to the Redis server"
@@ -656,6 +686,10 @@ class Connection(object):
         except:  # noqa: E722
             self.disconnect()
             raise
+
+        if self.health_check_interval:
+            self.next_health_check = time() + self.next_health_check
+
         if isinstance(response, ResponseError):
             raise response
         return response
@@ -777,13 +811,16 @@ class UnixDomainSocketConnection(Connection):
                  socket_timeout=None, encoding='utf-8',
                  encoding_errors='strict', decode_responses=False,
                  retry_on_timeout=False,
-                 parser_class=DefaultParser, socket_read_size=65536):
+                 parser_class=DefaultParser, socket_read_size=65536,
+                 health_check_interval=0):
         self.pid = os.getpid()
         self.path = path
         self.db = db
         self.password = password
         self.socket_timeout = socket_timeout
         self.retry_on_timeout = retry_on_timeout
+        self.health_check_interval = health_check_interval
+        self.next_health_check = 0
         self.encoder = Encoder(encoding, encoding_errors, decode_responses)
         self._sock = None
         self._parser = parser_class(socket_read_size=socket_read_size)
@@ -829,6 +866,7 @@ URL_QUERY_ARGUMENT_PARSERS = {
     'socket_keepalive': to_bool,
     'retry_on_timeout': to_bool,
     'max_connections': int,
+    'health_check_interval': int,
 }
 
 
