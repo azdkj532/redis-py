@@ -451,6 +451,33 @@ else:
     DefaultParser = PythonParser
 
 
+class _SocketCloser(object):
+    disconnect_called = False
+    pid = None
+    socket = None
+
+    def __init__(self, socket):
+        self.disconnect_called = False
+        self.pid = os.getpid()
+        self.socket = socket
+
+    def __del__(self):
+        self.disconnect()
+
+    # cache getpid before os module is None'd out in shutdown phase.
+    def disconnect(self, getpid=os.getpid):
+        "Disconnects from the Redis server"
+        if self.socket is None or self.disconnect_called:
+            return
+        try:
+            if getpid() == self.pid:
+                self.socket.shutdown(socket.SHUT_RDWR)
+            self.socket.close()
+        except socket.error:
+            pass
+        self.socket = None
+
+
 class Connection(object):
     "Manages TCP communication to and from a Redis server"
     description_format = "Connection<host=%(host)s,port=%(port)s,db=%(db)s>"
@@ -474,6 +501,7 @@ class Connection(object):
         self.retry_on_timeout = retry_on_timeout
         self.encoder = Encoder(encoding, encoding_errors, decode_responses)
         self._sock = None
+        self._sock_closer = None
         self._parser = parser_class(socket_read_size=socket_read_size)
         self._description_args = {
             'host': self.host,
@@ -485,12 +513,6 @@ class Connection(object):
 
     def __repr__(self):
         return self.description_format % self._description_args
-
-    def __del__(self):
-        try:
-            self.disconnect()
-        except Exception:
-            pass
 
     def register_connect_callback(self, callback):
         self._connect_callbacks.append(callback)
@@ -511,6 +533,7 @@ class Connection(object):
             raise ConnectionError(self._error_message(e))
 
         self._sock = sock
+        self._sock_closer = _SocketCloser(sock)
         try:
             self.on_connect()
         except RedisError:
@@ -591,16 +614,7 @@ class Connection(object):
 
     def disconnect(self):
         "Disconnects from the Redis server"
-        self._parser.on_disconnect()
-        if self._sock is None:
-            return
-        try:
-            if os.getpid() == self.pid:
-                self._sock.shutdown(socket.SHUT_RDWR)
-            self._sock.close()
-        except socket.error:
-            pass
-        self._sock = None
+        self._sock_closer.disconnect()
 
     def send_packed_command(self, command):
         "Send an already packed command to the Redis server"
