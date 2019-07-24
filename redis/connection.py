@@ -487,6 +487,9 @@ class Connection(object):
         self._connect_callbacks = []
         self._buffer_cutoff = 6000
 
+        # TODO: remove me -- testing purposes only
+        self.health_check_interval = 10
+
     def __repr__(self):
         return self.description_format % self._description_args
 
